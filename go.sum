@@ -1,0 +1,4 @@
+github.com/bytedance/gopkg v0.1.2 h1:8o2feYuxknDpN+O7kPwvSXfMEKfYvJYiA2K7aonoMEQ=
+github.com/bytedance/gopkg v0.1.2/go.mod h1:576VvJ+eJgyCzdjS+c4+77QF3p7ubbtiKARP3TxducM=
+github.com/cloudwego/gopkg v0.1.5 h1:wxzw/EFtuK61sp5dR6eb9FRv72wZuQZz+AUUWBMHKn8=
+github.com/cloudwego/gopkg v0.1.5/go.mod h1:FQuXsRWRsSqJLsMVd5SYzp8/Z1y5gXKnVvRrWUOsCMI=
