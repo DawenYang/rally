@@ -1,202 +1,254 @@
-use async_task::{Runnable, Task};
-use flume::{Receiver, Sender};
-use futures_lite::future;
-use std::panic::catch_unwind;
+use crate::reactor::{Reactor, ReactorHandle};
+use crossbeam_channel::{Receiver, Sender};
+use futures::task::{self, ArcWake};
+use hyper::rt::Executor;
+use num_cpus;
+use std::future::Future;
 use std::pin::Pin;
-use std::sync::LazyLock;
-use std::task::{Context, Poll};
+use std::sync::{Arc, Mutex};
+use std::task::Context;
 use std::thread;
 use std::time::Duration;
 
-#[derive(Debug, Clone, Copy)]
-pub enum FutureType {
-    High,
-    Low,
+thread_local! {
+    static REACTOR_HANDLE: std::cell::RefCell<Option<ReactorHandle>> = std::cell::RefCell::new(None);
 }
 
-pub fn spawn_task_function<F, T>(future: F, order: FutureType) -> Task<T>
+pub fn reactor() -> ReactorHandle {
+    REACTOR_HANDLE.with(|handle| handle.borrow().as_ref().unwrap().clone())
+}
+
+// --- Sleep Future using futures-timer ---
+
+pub fn sleep(duration: Duration) -> impl Future<Output = ()> {
+    futures_timer::Delay::new(duration)
+}
+
+// --- Runtime startup function ---
+
+pub async fn start_runtime() -> Runtime {
+    Builder::new().build()
+}
+
+// Hyper executor implementation for our custom runtime
+impl<Fut> Executor<Fut> for Spawner
 where
-    F: Future<Output = T> + Send + 'static,
-    T: Send + 'static,
+    Fut: Future<Output = ()> + Send + 'static,
 {
-    static HIGH_CHANNEL: LazyLock<(Sender<Runnable>, Receiver<Runnable>)> =
-        LazyLock::new(|| flume::unbounded::<Runnable>());
-    static LOW_CHANNEL: LazyLock<(Sender<Runnable>, Receiver<Runnable>)> =
-        LazyLock::new(|| flume::unbounded::<Runnable>());
-
-    static HIGH_QUEUE: LazyLock<flume::Sender<Runnable>> = LazyLock::new(|| {
-        let high_num = std::env::var("HIGH_NUM").unwrap().parse::<usize>().unwrap();
-        for _ in 0..high_num {
-            let high_receiver = HIGH_CHANNEL.1.clone();
-            let low_receiver = LOW_CHANNEL.1.clone();
-            thread::spawn(move || {
-                loop {
-                    match high_receiver.try_recv() {
-                        Ok(runnable) => {
-                            let _ = catch_unwind(|| runnable.run());
-                        }
-                        Err(_) => match low_receiver.try_recv() {
-                            Ok(runnable) => {
-                                let _ = catch_unwind(|| runnable.run());
-                            }
-                            Err(_) => {
-                                thread::sleep(Duration::from_millis(100));
-                            }
-                        },
-                    };
-                }
-            });
-        }
-        HIGH_CHANNEL.0.clone()
-    });
-    static LOW_QUEUE: LazyLock<flume::Sender<Runnable>> = LazyLock::new(|| {
-        let low_num = std::env::var("LOW_NUM").unwrap().parse::<usize>().unwrap();
-
-        for _ in 0..low_num {
-            let high_receiver = HIGH_CHANNEL.1.clone();
-            let low_recevier = LOW_CHANNEL.1.clone();
-            thread::spawn(move || {
-                loop {
-                    match low_recevier.try_recv() {
-                        Ok(runnable) => {
-                            let _ = catch_unwind(|| runnable.run());
-                        }
-                        Err(_) => match high_receiver.try_recv() {
-                            Ok(runnable) => {
-                                let _ = catch_unwind(|| runnable.run());
-                            }
-                            Err(_) => {
-                                thread::sleep(Duration::from_millis(100));
-                            }
-                        },
-                    };
-                }
-            });
-        }
-        LOW_CHANNEL.0.clone()
-    });
-    let schedule_high = |runnable| HIGH_QUEUE.send(runnable).unwrap();
-    let schedule_low = |runnable| LOW_QUEUE.send(runnable).unwrap();
-
-    let schedule = match order {
-        FutureType::High => schedule_high,
-        FutureType::Low => schedule_low,
-    };
-    let (runnable, task) = async_task::spawn(future, schedule);
-    runnable.schedule();
-    task
-}
-
-struct CounterFuture {
-    count: u32,
-}
-
-impl Future for CounterFuture {
-    type Output = u32;
-
-    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        self.count += 1;
-        println!("polling with result: {}", self.count);
-        std::thread::sleep(Duration::from_secs(1));
-        if self.count < 3 {
-            cx.waker().wake_by_ref();
-            Poll::Pending
-        } else {
-            Poll::Ready(self.count)
-        }
+    fn execute(&self, fut: Fut) {
+        self.spawn(fut);
     }
 }
 
-pub async fn async_fn() {
-    thread::sleep(Duration::from_secs(1));
-    println!("async fn")
+// --- Task and Spawner ---
+
+struct Task {
+    future: Mutex<Pin<Box<dyn Future<Output = ()> + Send>>>,
+    sender: Sender<Arc<Task>>,
 }
 
-#[macro_export]
-macro_rules! spawn_task {
-    ($future:expr) => {
-        spawn_task!($future, FutureType::Low)
-    };
-    ($future:expr, $order:expr) => {
-        spawn_task_function($future, $order)
-    };
+impl ArcWake for Task {
+    fn wake_by_ref(arc_self: &Arc<Self>) {
+        let self_clone = arc_self.clone();
+        arc_self
+            .sender
+            .send(self_clone)
+            .expect("Failed to send task");
+    }
 }
 
-#[macro_export]
-macro_rules! join {
-    ($($future:expr), *) => {
-        {
-            let mut results = Vec::new();
-            $(
-                let result = catch_unwind(|| future::block_on($future));
-                results.push(result);
-            )*
-            results
-        }
-    };
+#[derive(Clone)]
+#[allow(dead_code)]
+pub struct Spawner {
+    sender: Sender<Arc<Task>>,
+    pub reactor_handle: ReactorHandle,
 }
 
-#[macro_export]
-macro_rules! try_join {
-    ($($future:expr),*) => {
-        {
-            let mut results = Vec::new();
-            $(
-                let result = catch_unwind(|| future::block_on($future));
-                results.push(result);
-            )*
-            results
-        }
-    };
+impl Spawner {
+    pub fn spawn(&self, future: impl Future<Output = ()> + Send + 'static) {
+        let future = Box::pin(future);
+        let task = Arc::new(Task {
+            future: Mutex::new(future),
+            sender: self.sender.clone(),
+        });
+        self.sender.send(task).expect("Failed to send task");
+    }
+}
+
+// --- Runtime and Builder ---
+
+#[derive(Default)]
+pub struct Builder {
+    threads: Option<usize>,
+}
+
+impl Builder {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn threads(mut self, threads: usize) -> Self {
+        self.threads = Some(threads);
+        self
+    }
+
+    pub fn build(self) -> Runtime {
+        Runtime::new(self.threads.unwrap_or_else(num_cpus::get))
+    }
 }
 
 pub struct Runtime {
-    high_num: usize,
-    low_num: usize,
+    _handles: Vec<thread::JoinHandle<()>>,
+    spawner: Spawner,
+    shutdown_tx: Sender<()>,
 }
 
 impl Runtime {
-    pub fn new() -> Self {
-        let num_cores = std::thread::available_parallelism().unwrap().get();
+    fn new(threads: usize) -> Self {
+        let (task_sender, task_receiver): (Sender<Arc<Task>>, Receiver<Arc<Task>>) =
+            crossbeam_channel::unbounded();
+        let (shutdown_tx, shutdown_rx) = crossbeam_channel::unbounded();
+        let (reactor_cmd_sender, reactor_cmd_receiver) = crossbeam_channel::unbounded();
+
+        let mut reactor = Reactor::new();
+        let waker = Arc::new(
+            mio::Waker::new(reactor.poll_registry(), crate::reactor::WAKER_TOKEN)
+                .expect("Failed to create reactor waker"),
+        );
+        let reactor_handle = ReactorHandle {
+            sender: reactor_cmd_sender,
+            waker: waker.clone(),
+        };
+
+        let shutdown_rx_clone = shutdown_rx.clone();
+        let reactor_thread = thread::spawn(move || {
+            reactor.run(reactor_cmd_receiver, shutdown_rx_clone);
+        });
+
+        let mut handles = Vec::new();
+        for _ in 0..threads {
+            let task_receiver = task_receiver.clone();
+            let shutdown_rx = shutdown_rx.clone();
+            let reactor_handle = reactor_handle.clone();
+
+            handles.push(thread::spawn(move || {
+                REACTOR_HANDLE.with(|handle| {
+                    *handle.borrow_mut() = Some(reactor_handle);
+                });
+
+                loop {
+                    crossbeam_channel::select! {
+                        recv(task_receiver) -> msg => {
+                            if let Ok(task) = msg {
+                                let mut future = task.future.lock().unwrap();
+                                let waker = task::waker(task.clone());
+                                let mut context = Context::from_waker(&waker);
+                                let _ = future.as_mut().poll(&mut context);
+                            }
+                        },
+                        recv(shutdown_rx) -> _ => {
+                            break;
+                        }
+                    }
+                }
+            }));
+        }
+
+        handles.push(reactor_thread);
 
         Self {
-            high_num: num_cores - 2,
-            low_num: 1,
+            _handles: handles,
+            spawner: Spawner {
+                sender: task_sender,
+                reactor_handle,
+            },
+            shutdown_tx,
         }
     }
 
-    pub fn with_high_num(mut self, num: usize) -> Self {
-        self.high_num = num;
-        self
+    pub fn spawner(&self) -> Spawner {
+        self.spawner.clone()
     }
 
-    pub fn with_low_num(mut self, num: usize) -> Self {
-        self.low_num = num;
-        self
-    }
-
-    pub fn run(&self) {
-        unsafe {
-            std::env::set_var("HIGH_NUM", self.high_num.to_string());
-            std::env::set_var("LOW_NUM", self.low_num.to_string());
+    pub fn shutdown(self) {
+        for _ in 0..self._handles.len() {
+            self.shutdown_tx.send(()).unwrap();
         }
-
-        let high = spawn_task!(async {}, FutureType::High);
-        let low = spawn_task!(async {}, FutureType::Low);
-        join!(high, low);
+        for handle in self._handles {
+            handle.join().unwrap();
+        }
     }
 }
 
-#[derive(Debug, Clone, Copy)]
-pub struct BackgroundProcess;
+#[cfg(test)]
+mod tests {
+    use super::{sleep, Builder};
+    use std::sync::{Arc, Mutex};
+    use std::time::{Duration, Instant};
 
-impl Future for BackgroundProcess {
-    type Output = ();
+    #[test]
+    fn test_spawn_task() {
+        let runtime = Builder::new().threads(1).build();
+        let spawner = runtime.spawner();
 
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        println!("background process firing");
-        std::thread::sleep(Duration::from_secs(1));
-        cx.waker().wake_by_ref();
-        Poll::Pending
+        let flag = Arc::new(Mutex::new(false));
+        let flag_clone = flag.clone();
+
+        spawner.spawn(async move {
+            *flag_clone.lock().unwrap() = true;
+        });
+
+        // Give the runtime some time to run the task
+        std::thread::sleep(Duration::from_millis(100));
+
+        assert!(*flag.lock().unwrap());
+        runtime.shutdown();
+    }
+
+    #[test]
+    fn test_sleep() {
+        let runtime = Builder::new().threads(1).build();
+        let spawner = runtime.spawner();
+
+        let start = Instant::now();
+        let duration = Duration::from_millis(200);
+
+        spawner.spawn(async move {
+            sleep(duration).await;
+        });
+
+        std::thread::sleep(duration + Duration::from_millis(100));
+
+        assert!(start.elapsed() >= duration);
+        runtime.shutdown();
+    }
+
+    #[test]
+    fn test_multiple_tasks() {
+        let runtime = Builder::new().threads(2).build();
+        let spawner = runtime.spawner();
+
+        let results = Arc::new(Mutex::new(Vec::new()));
+
+        let results_clone1 = results.clone();
+        spawner.spawn(async move {
+            sleep(Duration::from_millis(200)).await;
+            results_clone1.lock().unwrap().push(1);
+        });
+
+        let results_clone2 = results.clone();
+        spawner.spawn(async move {
+            sleep(Duration::from_millis(100)).await;
+            results_clone2.lock().unwrap().push(2);
+        });
+
+        std::thread::sleep(Duration::from_millis(400));
+
+        let results = results.lock().unwrap();
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0], 2);
+        assert_eq!(results[1], 1);
+
+        runtime.shutdown();
     }
 }
