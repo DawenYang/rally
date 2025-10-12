@@ -1,11 +1,14 @@
 use std::{
     io::{self, Cursor, ErrorKind, Read, Write},
-    net::TcpStream,
-    sync::atomic::AtomicBool,
+    net::{TcpListener, TcpStream},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        mpsc,
+    },
     thread,
 };
 
-use async_runtime::sleep::Sleep;
+use async_runtime::{executor::Executor, sleep::Sleep};
 use data_layer::data::Data;
 
 static FLAGS: [AtomicBool; 3] = [
@@ -74,5 +77,44 @@ async fn handle_client(mut stream: TcpStream) -> io::Result<()> {
     }
     Sleep::new(std::time::Duration::from_secs(1)).await;
     stream.write_all(b"Hello, client!")?;
+    Ok(())
+}
+
+pub fn start_server(addr: &str) -> io::Result<()> {
+    let listener = TcpListener::bind(addr)?;
+    println!("Server listening on {}", addr);
+
+    let (one_tx, one_rx) = mpsc::channel::<TcpStream>();
+    let (two_tx, two_rx) = mpsc::channel::<TcpStream>();
+    let (three_tx, three_rx) = mpsc::channel::<TcpStream>();
+
+    // Spawn 3 worker threads
+    let worker1 = spawn_worker!("Worker-1", one_rx, &FLAGS[0]);
+    let worker2 = spawn_worker!("Worker-2", two_rx, &FLAGS[1]);
+    let worker3 = spawn_worker!("Worker-3", three_rx, &FLAGS[2]);
+
+    let router = [one_tx, two_tx, three_tx];
+    let worker_pool = [worker1, worker2, worker3];
+    let mut index = 0;
+
+    // Accept connections and distribute to workers
+    for stream in listener.incoming() {
+        match stream {
+            Ok(stream) => {
+                let _ = router[index].send(stream);
+                if FLAGS[index].load(Ordering::SeqCst) {
+                    FLAGS[index].store(false, Ordering::SeqCst);
+                    worker_pool[index].thread().unpark();
+                }
+                index += 1;
+                if index == 3 {
+                    index = 0;
+                }
+            }
+            Err(e) => {
+                eprintln!("Connection failed: {}", e);
+            }
+        }
+    }
     Ok(())
 }

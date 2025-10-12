@@ -1,4 +1,5 @@
 use std::{
+    future::Future,
     io::{self, Read},
     net::TcpStream,
     sync::{Arc, Mutex},
@@ -27,19 +28,39 @@ impl Future for TcpReceiver {
         stream.set_nonblocking(true)?;
         let mut local_buf = [0; 1024];
 
-        match stream.read(&mut local_buf) {
-            Ok(0) => Poll::Ready(Ok(self.buffer.to_vec())),
-            Ok(n) => {
-                drop(stream);
-                self.buffer.extend_from_slice(&local_buf[..n]);
-                cx.waker().wake_by_ref();
-                Poll::Pending
+        loop {
+            match stream.read(&mut local_buf) {
+                Ok(0) => {
+                    // EOF - return what we have
+                    return Poll::Ready(Ok(self.buffer.to_vec()));
+                }
+                Ok(n) => {
+                    drop(stream);
+                    self.buffer.extend_from_slice(&local_buf[..n]);
+                    // Re-acquire lock for next iteration
+                    stream = match self.stream.try_lock() {
+                        Ok(s) => s,
+                        Err(_) => {
+                            cx.waker().wake_by_ref();
+                            return Poll::Pending;
+                        }
+                    };
+                    stream.set_nonblocking(true)?;
+                }
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    // No more data available right now
+                    if self.buffer.is_empty() {
+                        // Haven't received anything yet, keep waiting
+                        cx.waker().wake_by_ref();
+                        return Poll::Pending;
+                    } else {
+                        // We have some data, but there might be more coming
+                        // For now, return what we have
+                        return Poll::Ready(Ok(self.buffer.to_vec()));
+                    }
+                }
+                Err(e) => return Poll::Ready(Err(e)),
             }
-            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                cx.waker().wake_by_ref();
-                Poll::Pending
-            }
-            Err(e) => Poll::Ready(Err(e)),
         }
     }
 }

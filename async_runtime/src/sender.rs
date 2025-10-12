@@ -1,4 +1,5 @@
 use std::{
+    future::Future,
     io::{self, Write},
     net::TcpStream,
     sync::{Arc, Mutex},
@@ -8,13 +9,14 @@ use std::{
 pub struct TcpSender {
     pub stream: Arc<Mutex<TcpStream>>,
     pub buffer: Vec<u8>,
+    pub written: usize,
 }
 
 impl Future for TcpSender {
     type Output = io::Result<()>;
 
     fn poll(
-        self: std::pin::Pin<&mut Self>,
+        mut self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Self::Output> {
         let mut stream = match self.stream.try_lock() {
@@ -25,13 +27,37 @@ impl Future for TcpSender {
             }
         };
         stream.set_nonblocking(true)?;
-        match stream.write_all(&self.buffer) {
-            Ok(_) => Poll::Ready(Ok(())),
-            Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
-                cx.waker().wake_by_ref();
-                Poll::Pending
+
+        loop {
+            if self.written >= self.buffer.len() {
+                return Poll::Ready(Ok(()));
             }
-            Err(e) => Poll::Ready(Err(e)),
+
+            match stream.write(&self.buffer[self.written..]) {
+                Ok(0) => {
+                    return Poll::Ready(Err(io::Error::new(
+                        io::ErrorKind::WriteZero,
+                        "write zero bytes",
+                    )));
+                }
+                Ok(n) => {
+                    drop(stream);
+                    self.written += n;
+                    // Re-acquire lock for next iteration
+                    stream = match self.stream.try_lock() {
+                        Ok(s) => s,
+                        Err(_) => {
+                            cx.waker().wake_by_ref();
+                            return Poll::Pending;
+                        }
+                    };
+                }
+                Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    cx.waker().wake_by_ref();
+                    return Poll::Pending;
+                }
+                Err(e) => return Poll::Ready(Err(e)),
+            }
         }
     }
 }
