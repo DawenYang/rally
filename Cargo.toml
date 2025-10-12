@@ -1,21 +1,23 @@
-[workspace]
-resolver = "2"
-members = [
-    "async_runtime",
-    "client", "data_layer", "server",
-]
-
 [package]
 name = "rally"
 version = "0.1.0"
 edition = "2021"
+
+[workspace]
+resolver = "2"
+members = [
+  "async_runtime",
+  "client",
+  "data_layer",
+  "server",
+]
 
 [[bin]]
 name = "rally"
 path = "src/main.rs"
 
 [dependencies]
+async_runtime = { path = "./async_runtime" }
 client = { path = "./client" }
 data_layer = { path = "./data_layer" }
 server = { path = "./server" }
-async_runtime = { path = "./async_runtime" }
