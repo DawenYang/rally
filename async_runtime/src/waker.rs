@@ -1,22 +1,51 @@
-use std::task::{RawWaker, RawWakerVTable};
+use std::{
+    sync::{mpsc::Sender, Arc},
+    task::{RawWaker, RawWakerVTable, Waker},
+};
 
-static VTABLE: RawWakerVTable = RawWakerVTable::new(my_clone, my_wake, my_wake_by_ref, my_drop);
+static VTABLE: RawWakerVTable = RawWakerVTable::new(clone_waker, wake, wake_by_ref, drop_waker);
 
-unsafe fn my_clone(raw_waker: *const ()) -> RawWaker {
-    RawWaker::new(raw_waker, &VTABLE)
+#[derive(Clone)]
+pub struct TaskWaker {
+    task_id: usize,
+    sender: Sender<usize>,
 }
 
-unsafe fn my_wake(raw_waker: *const ()) {
-    drop(Box::from_raw(raw_waker as *mut u32));
+impl TaskWaker {
+    pub fn new(task_id: usize, sender: Sender<usize>) -> Self {
+        Self { task_id, sender }
+    }
+
+    pub fn into_waker(self) -> Waker {
+        let arc = Arc::new(self);
+        let raw = Arc::into_raw(arc);
+        unsafe { Waker::from_raw(RawWaker::new(raw as *const (), &VTABLE)) }
+    }
 }
 
-unsafe fn my_wake_by_ref(_raw_waker: *const ()) {}
-
-unsafe fn my_drop(raw_waker: *const ()) {
-    drop(Box::from_raw(raw_waker as *mut u32));
+unsafe fn clone_waker(ptr: *const ()) -> RawWaker {
+    let arc = Arc::from_raw(ptr as *const TaskWaker);
+    let cloned = arc.clone();
+    // Drop arc got cloned
+    std::mem::forget(arc);
+    let raw = Arc::into_raw(cloned);
+    RawWaker::new(raw as *const (), &VTABLE)
 }
 
-pub fn create_raw_waker() -> RawWaker {
-    let data = Box::into_raw(Box::new(42u32));
-    RawWaker::new(data as *const (), &VTABLE)
+unsafe fn wake(ptr: *const ()) {
+    let arc = Arc::from_raw(ptr as *const TaskWaker);
+    // Send task ID to wake the task
+    let _ = arc.sender.send(arc.task_id);
+    // Arc is dropped here, decrementing the reference count
+}
+
+unsafe fn wake_by_ref(ptr: *const ()) {
+    let arc = Arc::from_raw(ptr as *const TaskWaker);
+    let _ = arc.sender.send(arc.task_id);
+    std::mem::forget(arc);
+}
+
+unsafe fn drop_waker(ptr: *const ()) {
+    let _ = Arc::from_raw(ptr as *const TaskWaker);
+    // Arc is dropped here
 }

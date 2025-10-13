@@ -1,26 +1,33 @@
 use std::{
-    collections::VecDeque,
+    collections::{HashMap, VecDeque},
     future::Future,
     pin::Pin,
-    sync::{Arc, mpsc},
+    sync::{mpsc, Arc},
     task::{Context, Poll, Waker},
 };
 
-use crate::waker::create_raw_waker;
+use crate::waker::TaskWaker;
 
 pub struct Task {
+    id: usize,
     future: Pin<Box<dyn Future<Output = ()> + Send>>,
-    waker: Arc<Waker>,
 }
 
 pub struct Executor {
-    pub polling: VecDeque<Task>,
+    tasks: HashMap<usize, Task>,
+    ready_queue: mpsc::Receiver<usize>,
+    waker_sender: mpsc::Sender<usize>,
+    next_task_id: usize,
 }
 
 impl Executor {
     pub fn new() -> Self {
+        let (tx, rx) = mpsc::channel();
         Executor {
-            polling: VecDeque::new(),
+            tasks: HashMap::new(),
+            ready_queue: rx,
+            waker_sender: tx,
+            next_task_id: 0,
         }
     }
 
@@ -29,35 +36,65 @@ impl Executor {
         F: Future<Output = T> + 'static + Send,
         T: Send + 'static,
     {
+        let task_id = self.next_task_id;
+        self.next_task_id += 1;
+
         let (tx, rx) = mpsc::channel();
         let future: Pin<Box<dyn Future<Output = ()> + Send>> = Box::pin(async move {
             let result = future.await;
             let _ = tx.send(result);
         });
+
         let task = Task {
+            id: task_id,
             future,
-            waker: self.create_waker(),
         };
-        self.polling.push_back(task);
+
+        self.tasks.insert(task_id, task);
+
+        let _ = self.waker_sender.send(task_id);
         rx
     }
 
     pub fn poll(&mut self) {
-        let mut task = match self.polling.pop_front() {
-            Some(task) => task,
-            None => return,
-        };
-        let waker = task.waker.clone();
-        let context = &mut Context::from_waker(&waker);
-        match task.future.as_mut().poll(context) {
-            Poll::Ready(()) => {}
-            Poll::Pending => {
-                self.polling.push_back(task);
+        if let Ok(task_id) = self.ready_queue.try_recv() {
+            let mut task = match self.tasks.remove(&task_id) {
+                Some(task) => task,
+                None => return,
+            };
+            let waker = TaskWaker::new(task_id, self.waker_sender.clone()).into_waker();
+            let mut context = Context::from_waker(&waker);
+
+            match task.future.as_mut().poll(&mut context) {
+                Poll::Ready(()) => {}
+                Poll::Pending => {
+                    self.tasks.insert(task_id, task);
+                }
             }
         }
     }
 
-    pub fn create_waker(&self) -> Arc<Waker> {
-        Arc::new(unsafe { Waker::from_raw(create_raw_waker()) })
+    pub fn run(&mut self) {
+        while !self.tasks.is_empty() {
+            let task_id = match self.ready_queue.recv() {
+                Ok(id) => id,
+                Err(_) => break, // break run loop when there are no more tasks
+            };
+
+            let mut task = match self.tasks.remove(&task_id) {
+                Some(task) => task,
+                None => continue, // Task was already completed
+            };
+
+            let waker = TaskWaker::new(task_id, self.waker_sender.clone()).into_waker();
+            let mut context = Context::from_waker(&waker);
+
+            match task.future.as_mut().poll(&mut context) {
+                Poll::Ready(()) => {}
+                Poll::Pending => {
+                    self.tasks.insert(task_id, task);
+                }
+            }
+        }
     }
 }
