@@ -1,8 +1,0 @@
-[package]
-name = "server"
-version = "0.1.0"
-edition = "2021"
-
-[dependencies]
-async_runtime = { path = "../async_runtime" }
-data_layer = { path = "../data_layer" }

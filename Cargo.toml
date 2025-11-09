@@ -3,21 +3,10 @@ name = "rally"
 version = "0.1.0"
 edition = "2021"
 
-[workspace]
-resolver = "2"
-members = [
-  "async_runtime",
-  "client",
-  "data_layer",
-  "server",
-]
-
 [[bin]]
 name = "rally"
-path = "src/main.rs"
+path = "src/lib.rs"
 
 [dependencies]
-async_runtime = { path = "./async_runtime" }
-client = { path = "./client" }
-data_layer = { path = "./data_layer" }
-server = { path = "./server" }
+rusoto_core = "0.48.0"
+rusoto_ec2 = "0.48.0"
